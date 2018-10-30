@@ -185,6 +185,8 @@ static int FUNC(vui_parameters)(CodedBitstreamContext *ctx, RWContext *rw,
         flag(motion_vectors_over_pic_boundaries_flag);
         ue(max_bytes_per_pic_denom, 0, 16);
         ue(max_bits_per_mb_denom,   0, 16);
+        // The current version of the standard constrains this to be in
+        // [0,15], but older versions allow 16.
         ue(log2_max_mv_length_horizontal, 0, 16);
         ue(log2_max_mv_length_vertical,   0, 16);
         ue(max_num_reorder_frames,  0, H264_MAX_DPB_FRAMES);
@@ -193,11 +195,11 @@ static int FUNC(vui_parameters)(CodedBitstreamContext *ctx, RWContext *rw,
         infer(motion_vectors_over_pic_boundaries_flag, 1);
         infer(max_bytes_per_pic_denom, 2);
         infer(max_bits_per_mb_denom,   1);
-        infer(log2_max_mv_length_horizontal, 16);
-        infer(log2_max_mv_length_vertical,   16);
+        infer(log2_max_mv_length_horizontal, 15);
+        infer(log2_max_mv_length_vertical,   15);
 
         if ((sps->profile_idc ==  44 || sps->profile_idc ==  86 ||
-             sps->profile_idc == 110 || sps->profile_idc == 110 ||
+             sps->profile_idc == 100 || sps->profile_idc == 110 ||
              sps->profile_idc == 122 || sps->profile_idc == 244) &&
             sps->constraint_set3_flag) {
             infer(max_num_reorder_frames,  0);
@@ -206,6 +208,46 @@ static int FUNC(vui_parameters)(CodedBitstreamContext *ctx, RWContext *rw,
             infer(max_num_reorder_frames,  H264_MAX_DPB_FRAMES);
             infer(max_dec_frame_buffering, H264_MAX_DPB_FRAMES);
         }
+    }
+
+    return 0;
+}
+
+static int FUNC(vui_parameters_default)(CodedBitstreamContext *ctx,
+                                        RWContext *rw, H264RawVUI *current,
+                                        H264RawSPS *sps)
+{
+    infer(aspect_ratio_idc, 0);
+
+    infer(video_format,             5);
+    infer(video_full_range_flag,    0);
+    infer(colour_primaries,         2);
+    infer(transfer_characteristics, 2);
+    infer(matrix_coefficients,      2);
+
+    infer(chroma_sample_loc_type_top_field,    0);
+    infer(chroma_sample_loc_type_bottom_field, 0);
+
+    infer(fixed_frame_rate_flag, 0);
+    infer(low_delay_hrd_flag,    1);
+
+    infer(pic_struct_present_flag, 0);
+
+    infer(motion_vectors_over_pic_boundaries_flag, 1);
+    infer(max_bytes_per_pic_denom, 2);
+    infer(max_bits_per_mb_denom,   1);
+    infer(log2_max_mv_length_horizontal, 15);
+    infer(log2_max_mv_length_vertical,   15);
+
+    if ((sps->profile_idc ==  44 || sps->profile_idc ==  86 ||
+         sps->profile_idc == 100 || sps->profile_idc == 110 ||
+         sps->profile_idc == 122 || sps->profile_idc == 244) &&
+        sps->constraint_set3_flag) {
+        infer(max_num_reorder_frames,  0);
+        infer(max_dec_frame_buffering, 0);
+    } else {
+        infer(max_num_reorder_frames,  H264_MAX_DPB_FRAMES);
+        infer(max_dec_frame_buffering, H264_MAX_DPB_FRAMES);
     }
 
     return 0;
@@ -315,6 +357,8 @@ static int FUNC(sps)(CodedBitstreamContext *ctx, RWContext *rw,
     flag(vui_parameters_present_flag);
     if (current->vui_parameters_present_flag)
         CHECK(FUNC(vui_parameters)(ctx, rw, &current->vui, current));
+    else
+        CHECK(FUNC(vui_parameters_default)(ctx, rw, &current->vui, current));
 
     CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
 
@@ -507,10 +551,9 @@ static int FUNC(sei_buffering_period)(CodedBitstreamContext *ctx, RWContext *rw,
 }
 
 static int FUNC(sei_pic_timestamp)(CodedBitstreamContext *ctx, RWContext *rw,
-                                   H264RawSEIPicTimestamp *current)
+                                   H264RawSEIPicTimestamp *current,
+                                   const H264RawSPS *sps)
 {
-    CodedBitstreamH264Context *h264 = ctx->priv_data;
-    const H264RawSPS *sps;
     uint8_t time_offset_length;
     int err;
 
@@ -539,7 +582,6 @@ static int FUNC(sei_pic_timestamp)(CodedBitstreamContext *ctx, RWContext *rw,
         }
     }
 
-    sps = h264->active_sps;
     if (sps->vui.nal_hrd_parameters_present_flag)
         time_offset_length = sps->vui.nal_hrd_parameters.time_offset_length;
     else if (sps->vui.vcl_hrd_parameters_present_flag)
@@ -619,8 +661,33 @@ static int FUNC(sei_pic_timing)(CodedBitstreamContext *ctx, RWContext *rw,
         for (i = 0; i < num_clock_ts[current->pic_struct]; i++) {
             flags(clock_timestamp_flag[i], 1, i);
             if (current->clock_timestamp_flag[i])
-                CHECK(FUNC(sei_pic_timestamp)(ctx, rw, &current->timestamp[i]));
+                CHECK(FUNC(sei_pic_timestamp)(ctx, rw,
+                                              &current->timestamp[i], sps));
         }
+    }
+
+    return 0;
+}
+
+static int FUNC(sei_pan_scan_rect)(CodedBitstreamContext *ctx, RWContext *rw,
+                                   H264RawSEIPanScanRect *current)
+{
+    int err, i;
+
+    ue(pan_scan_rect_id, 0, UINT32_MAX - 1);
+    flag(pan_scan_rect_cancel_flag);
+
+    if (!current->pan_scan_rect_cancel_flag) {
+        ue(pan_scan_cnt_minus1, 0, 2);
+
+        for (i = 0; i <= current->pan_scan_cnt_minus1; i++) {
+            ses(pan_scan_rect_left_offset[i],   INT32_MIN + 1, INT32_MAX, 1, i);
+            ses(pan_scan_rect_right_offset[i],  INT32_MIN + 1, INT32_MAX, 1, i);
+            ses(pan_scan_rect_top_offset[i],    INT32_MIN + 1, INT32_MAX, 1, i);
+            ses(pan_scan_rect_bottom_offset[i], INT32_MIN + 1, INT32_MAX, 1, i);
+        }
+
+        ue(pan_scan_rect_repetition_period, 0, 16384);
     }
 
     return 0;
@@ -716,6 +783,25 @@ static int FUNC(sei_display_orientation)(CodedBitstreamContext *ctx, RWContext *
     return 0;
 }
 
+static int FUNC(sei_mastering_display_colour_volume)(CodedBitstreamContext *ctx, RWContext *rw,
+                                                     H264RawSEIMasteringDisplayColourVolume *current)
+{
+    int err, c;
+
+    for (c = 0; c < 3; c++) {
+        us(16, display_primaries_x[c], 0, 50000, 1, c);
+        us(16, display_primaries_y[c], 0, 50000, 1, c);
+    }
+
+    u(16, white_point_x, 0, 50000);
+    u(16, white_point_y, 0, 50000);
+
+    u(32, max_display_mastering_luminance, 1, MAX_UINT_BITS(32));
+    u(32, min_display_mastering_luminance, 0, current->max_display_mastering_luminance - 1);
+
+    return 0;
+}
+
 static int FUNC(sei_payload)(CodedBitstreamContext *ctx, RWContext *rw,
                              H264RawSEIPayload *current)
 {
@@ -736,6 +822,10 @@ static int FUNC(sei_payload)(CodedBitstreamContext *ctx, RWContext *rw,
     case H264_SEI_TYPE_PIC_TIMING:
         CHECK(FUNC(sei_pic_timing)
               (ctx, rw, &current->payload.pic_timing));
+        break;
+    case H264_SEI_TYPE_PAN_SCAN_RECT:
+        CHECK(FUNC(sei_pan_scan_rect)
+              (ctx, rw, &current->payload.pan_scan_rect));
         break;
     case H264_SEI_TYPE_FILLER_PAYLOAD:
         {
@@ -759,11 +849,18 @@ static int FUNC(sei_payload)(CodedBitstreamContext *ctx, RWContext *rw,
         CHECK(FUNC(sei_display_orientation)
               (ctx, rw, &current->payload.display_orientation));
         break;
+    case H264_SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME:
+        CHECK(FUNC(sei_mastering_display_colour_volume)
+              (ctx, rw, &current->payload.mastering_display_colour_volume));
+        break;
     default:
         {
-            allocate(current->payload.other.data, current->payload_size);
-            for (i = 0; i < current->payload_size; i++)
-                xu(8, payload_byte, current->payload.other.data[i], 0, 255, 1, i);
+#ifdef READ
+            current->payload.other.data_length = current->payload_size;
+#endif
+            allocate(current->payload.other.data, current->payload.other.data_length);
+            for (i = 0; i < current->payload.other.data_length; i++)
+                xu(8, payload_byte[i], current->payload.other.data[i], 0, 255, 1, i);
         }
     }
 
@@ -1270,4 +1367,22 @@ static int FUNC(filler)(CodedBitstreamContext *ctx, RWContext *rw,
     CHECK(FUNC(rbsp_trailing_bits)(ctx, rw));
 
     return 0;
+}
+
+static int FUNC(end_of_sequence)(CodedBitstreamContext *ctx, RWContext *rw,
+                                 H264RawNALUnitHeader *current)
+{
+    HEADER("End of Sequence");
+
+    return FUNC(nal_unit_header)(ctx, rw, current,
+                                 1 << H264_NAL_END_SEQUENCE);
+}
+
+static int FUNC(end_of_stream)(CodedBitstreamContext *ctx, RWContext *rw,
+                               H264RawNALUnitHeader *current)
+{
+    HEADER("End of Stream");
+
+    return FUNC(nal_unit_header)(ctx, rw, current,
+                                 1 << H264_NAL_END_STREAM);
 }
